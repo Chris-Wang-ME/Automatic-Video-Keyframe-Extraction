@@ -6,21 +6,20 @@ import zipfile
 import os
 from io import BytesIO
 
-# --- 页面设置 ---
-st.set_page_config(page_title="Mac 视频关键帧提取器", layout="wide")
-st.title("🎬 视频关键帧智能提取 (一键版)")
-st.markdown("上传视频后，系统将自动识别关键画面并过滤模糊帧。")
+# 页面基础配置
+st.set_page_config(page_title="镜头切换自动截帧工具", layout="wide")
+st.title("🎬 视频镜头自动识别与截帧")
+st.markdown("上传视频后，系统会自动分析画面，**每当镜头切换时**提取一张清晰的关键帧。")
 
 def get_blur_score(image):
-    """计算图像清晰度得分"""
+    """计算清晰度得分，过滤模糊帧"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 # --- 文件上传 ---
-uploaded_file = st.file_uploader("📂 请上传视频文件 (MP4, MOV, AVI)", type=["mp4", "mov", "avi"])
+uploaded_file = st.file_uploader("📂 选择视频文件 (MP4, MOV, AVI)", type=["mp4", "mov", "avi"])
 
-if uploaded_file is not None:
-    # 临时保存上传文件
+if uploaded_file:
     tfile = tempfile.NamedTemporaryFile(delete=False)
     tfile.write(uploaded_file.read())
     
@@ -28,22 +27,20 @@ if uploaded_file is not None:
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    if st.button("🚀 开始提取关键帧"):
+    if st.button("🚀 开始自动分析镜头"):
         progress_bar = st.progress(0)
         status_text = st.empty()
-        
         frames_to_save = []
         last_hist = None
         
-        # --- 后台预设参数 (不再显示滑块) ---
-        interval_secs = 1.0  # 每 1 秒扫描一次
-        blur_limit = 80.0    # 基础清晰度过滤
-        sensitivity = 0.95   # 场景切换灵敏度
+        # 预设镜头检测阈值
+        SENSITIVITY = 0.85  # 相似度低于 0.85 判定为新镜头
+        MIN_BLUR = 70.0     # 清晰度过滤
         
-        step = int(fps * interval_secs)
-        if step < 1: step = 1
+        # 为了网页端性能，每 3 帧扫描一次（不影响镜头切换捕捉）
+        step = 3 
         
-        cols = st.columns(4) # 每行显示4张预览图
+        cols = st.columns(4)
         img_count = 0
 
         for i in range(0, total_frames, step):
@@ -51,49 +48,43 @@ if uploaded_file is not None:
             ret, frame = cap.read()
             if not ret: break
             
-            # 1. 画面变化检测
+            # 计算直方图特征
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
             
-            is_new_scene = True
-            if last_hist is not None:
-                diff = cv2.compareHist(last_hist, hist, cv2.HISTCMP_CORREL)
-                if diff > sensitivity: 
-                    is_new_scene = False
+            is_shot_change = False
+            if last_hist is None:
+                is_shot_change = True
+            else:
+                # 比较当前帧与上一镜头的相似度
+                correlation = cv2.compareHist(last_hist, hist, cv2.HISTCMP_CORREL)
+                if correlation < SENSITIVITY:
+                    is_shot_change = True
             
-            # 2. 模糊过滤并保存
-            if is_new_scene:
-                if get_blur_score(frame) >= blur_limit:
+            if is_shot_change:
+                # 只有画面清晰才保存
+                if get_blur_score(frame) > MIN_BLUR:
                     frames_to_save.append(frame)
-                    
-                    # 实时预览
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # 实时显示预览
                     with cols[img_count % 4]:
-                        st.image(frame_rgb, caption=f"时间: {i/fps:.1f}s")
+                        st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), caption=f"镜头 {img_count+1}")
                     img_count += 1
-                
-                last_hist = hist
+                    # 更新参考帧，用于检测下一个镜头
+                    last_hist = hist
             
-            # 更新进度
             progress_bar.progress(min(i / total_frames, 1.0))
-            status_text.text(f"已处理: {int((i/total_frames)*100)}%")
+            status_text.text(f"分析进度: {int((i/total_frames)*100)}%")
 
         cap.release()
-        os.unlink(tfile.name) # 删除临时文件
-        st.success(f"处理完成！提取了 {len(frames_to_save)} 张关键帧。")
+        os.unlink(tfile.name)
+        st.success(f"处理完成！共识别到 {len(frames_to_save)} 个镜头。")
 
         # --- 打包下载 ---
         if frames_to_save:
-            zip_buffer = BytesIO()
-            with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zf:
+            zip_buf = BytesIO()
+            with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
                 for idx, f in enumerate(frames_to_save):
-                    is_success, buffer = cv2.imencode(".jpg", f)
-                    if is_success:
-                        zf.writestr(f"keyframe_{idx}.jpg", buffer.tobytes())
+                    _, buf = cv2.imencode(".jpg", f)
+                    zf.writestr(f"shot_{idx+1}.jpg", buf.tobytes())
             
-            st.download_button(
-                label="📥 点击下载所有关键帧 (ZIP)",
-                data=zip_buffer.getvalue(),
-                file_name="keyframes.zip",
-                mime="application/zip"
-            )
+            st.download_button("📥 下载镜头截图 (ZIP)", zip_buf.getvalue(), "shots.zip", "application/zip")
